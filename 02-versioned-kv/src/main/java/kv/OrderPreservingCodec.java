@@ -80,6 +80,9 @@ public class OrderPreservingCodec {
 
         // Bit-Inversion: Assigns newer timestamps practically smaller byte sequences
         // so that iteration scans natively yield the highest timestamps rapidly.
+        //It also helps traversing the versions from given version with normal seek/next operations of
+        //iterators even, even when we are actually traversing backwords from given version to get all the
+        //history with lower versions.
         putHybridTimestamp(buffer, key.getTimestamp());
         return buffer.array();
     }
