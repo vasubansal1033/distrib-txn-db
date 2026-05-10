@@ -1,6 +1,7 @@
-package com.distrib.txn.kv;
+package com.distrib.txn.kv.dsl;
 
 import clock.HybridTimestamp;
+import com.distrib.txn.kv.TransactionalStorageReplica;
 import com.tickloom.ProcessId;
 import kv.MVCCStore;
 import kv.OrderPreservingCodec;
@@ -14,7 +15,7 @@ public class ScenarioResult {
     private final Map<ProcessId, HybridTimestamp> nodeHlcSnapshots;
     private final Map<ProcessId, TransactionalStorageReplica> replicas;
     private final List<String> clientNames;
-    private final TransactionalStorageReplicaTestSupport.TopologyScenario topology;
+    private final TopologyScenario topology;
 
     ScenarioResult(
             Map<String, HybridTimestamp> snapshots,
@@ -22,7 +23,7 @@ public class ScenarioResult {
             Map<ProcessId, HybridTimestamp> nodeHlcSnapshots,
             Map<ProcessId, TransactionalStorageReplica> replicas,
             List<String> clientNames,
-            TransactionalStorageReplicaTestSupport.TopologyScenario topology
+            TopologyScenario topology
     ) {
         this.snapshots = snapshots;
         this.commitTimestamps = commitTimestamps;

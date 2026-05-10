@@ -1,4 +1,4 @@
-package com.distrib.txn.kv;
+package com.distrib.txn.kv.dsl;
 
 sealed interface ScenarioStep {
 

@@ -1,9 +1,9 @@
-package com.distrib.txn.kv;
+package com.distrib.txn.kv.dsl;
 
 import org.junit.jupiter.api.Test;
 
-import static com.distrib.txn.kv.TopologyConstraint.*;
-import static com.distrib.txn.kv.TransactionScenario.hlc;
+import static com.distrib.txn.kv.dsl.TopologyConstraint.*;
+import static com.distrib.txn.kv.dsl.TransactionScenario.hlc;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 

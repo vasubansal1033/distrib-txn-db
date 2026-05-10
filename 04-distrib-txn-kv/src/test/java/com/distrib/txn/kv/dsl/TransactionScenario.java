@@ -1,6 +1,7 @@
-package com.distrib.txn.kv;
+package com.distrib.txn.kv.dsl;
 
 import clock.HybridTimestamp;
+import com.distrib.txn.kv.*;
 import com.tickloom.ProcessId;
 import com.tickloom.testkit.Cluster;
 import kv.InMemoryMVCCStore;
@@ -13,7 +14,6 @@ import java.util.Map;
 import java.util.function.Predicate;
 import java.util.stream.IntStream;
 
-import static com.distrib.txn.kv.TransactionalStorageReplicaTestSupport.TopologyScenario;
 import static org.junit.jupiter.api.Assertions.*;
 
 public class TransactionScenario {

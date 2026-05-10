@@ -1,12 +1,10 @@
-package com.distrib.txn.kv;
+package com.distrib.txn.kv.dsl;
 
 import com.tickloom.ProcessId;
 
 import java.util.ArrayList;
 import java.util.List;
 import java.util.function.Predicate;
-
-import static com.distrib.txn.kv.TransactionalStorageReplicaTestSupport.TopologyScenario;
 
 public class TopologyConstraint {
 
@@ -21,12 +19,6 @@ public class TopologyConstraint {
     public static ClientConstraintBuilder where(String clientName) {
         return new ClientConstraintBuilder(clientName, new ArrayList<>());
     }
-
-    public static HybridTimestampRef hlc(long wallClock) {
-        return new HybridTimestampRef(wallClock);
-    }
-
-    public record HybridTimestampRef(long wallClock) {}
 
     public record NodeRef(String clientName) {
         static final NodeRef KEY_OWNER = new NodeRef("__key_owner__");
