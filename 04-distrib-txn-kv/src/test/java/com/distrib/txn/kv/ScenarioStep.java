@@ -8,7 +8,7 @@ sealed interface ScenarioStep {
                      WriteExpectation expectation) implements ScenarioStep {}
 
     record ReadStep(String clientName, String key,
-                    ReadExpectation expectation) implements ScenarioStep {}
+                    ReadExpectation expectation, String expectedValue) implements ScenarioStep {}
 
     record CommitStep(String clientName) implements ScenarioStep {}
 

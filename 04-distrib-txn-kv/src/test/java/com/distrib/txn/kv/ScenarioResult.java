@@ -57,34 +57,37 @@ public class ScenarioResult {
         return hlc;
     }
 
+    /**
+     * Returns the latest committed value for the scenario's shared key.
+     * In the current single-key DSL, all logical key names map to the same
+     * topology-discovered key. The parameter serves as documentation of intent
+     * and will be resolved properly when multi-key support is added.
+     */
     public String committedValue(String key) {
-        return committedValueForKey(resolvedKey());
+        return readLatestCommitted(topology.key());
     }
 
     public HybridTimestamp committedVersionTs(String key) {
+        String resolvedKey = topology.key();
         ProcessId keyOwner = topology.keyOwner();
         TransactionalStorageReplica replica = replicas.get(keyOwner);
         MVCCStore store = replica.committedStore();
         Map<HybridTimestamp, byte[]> versions = store.getVersionsUpTo(
-                OrderPreservingCodec.encodeString(resolvedKey()),
+                OrderPreservingCodec.encodeString(resolvedKey),
                 new HybridTimestamp(Long.MAX_VALUE, Integer.MAX_VALUE));
         return versions.keySet().stream()
                 .max(HybridTimestamp::compareTo)
                 .orElse(null);
     }
 
-    private String committedValueForKey(String key) {
+    private String readLatestCommitted(String resolvedKey) {
         ProcessId keyOwner = topology.keyOwner();
         TransactionalStorageReplica replica = replicas.get(keyOwner);
         MVCCStore store = replica.committedStore();
         return store.getAsOf(new kv.MVCCKey(
-                OrderPreservingCodec.encodeString(key),
+                OrderPreservingCodec.encodeString(resolvedKey),
                 new HybridTimestamp(Long.MAX_VALUE, Integer.MAX_VALUE)
         )).map(OrderPreservingCodec::decodeString).orElse(null);
-    }
-
-    private String resolvedKey() {
-        return topology.key();
     }
 
     private ProcessId resolveNode(TopologyConstraint.NodeRef node) {

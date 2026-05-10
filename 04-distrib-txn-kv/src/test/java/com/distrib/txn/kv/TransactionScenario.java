@@ -179,6 +179,10 @@ public class TransactionScenario {
                 } else {
                     assertTrue(response.found(),
                             s.clientName() + " read expected to find a value but didn't");
+                    if (s.expectedValue() != null) {
+                        assertEquals(s.expectedValue(), response.value(),
+                                s.clientName() + " read returned unexpected value");
+                    }
                 }
             }
             case ScenarioStep.CommitStep s -> {
@@ -295,19 +299,19 @@ public class TransactionScenario {
 
         public TransactionScenario expectNotFound() {
             scenario.addStep(new ScenarioStep.ReadStep(
-                    clientName, key, ScenarioStep.ReadExpectation.NOT_FOUND));
+                    clientName, key, ScenarioStep.ReadExpectation.NOT_FOUND, null));
             return scenario;
         }
 
         public TransactionScenario expectFound() {
             scenario.addStep(new ScenarioStep.ReadStep(
-                    clientName, key, ScenarioStep.ReadExpectation.FOUND));
+                    clientName, key, ScenarioStep.ReadExpectation.FOUND, null));
             return scenario;
         }
 
-        public TransactionScenario expectValue(String value) {
+        public TransactionScenario expectValue(String expectedValue) {
             scenario.addStep(new ScenarioStep.ReadStep(
-                    clientName, key, ScenarioStep.ReadExpectation.FOUND));
+                    clientName, key, ScenarioStep.ReadExpectation.FOUND, expectedValue));
             return scenario;
         }
     }
