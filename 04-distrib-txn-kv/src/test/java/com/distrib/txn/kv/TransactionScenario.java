@@ -87,15 +87,16 @@ public class TransactionScenario {
                 .start()) {
 
             Map<String, TransactionalStorageClient> clientMap = new HashMap<>();
+            TransactionalStorageClient firstClient = null;
             for (int i = 0; i < clients.size(); i++) {
                 ClientSpec spec = clients.get(i);
                 ProcessId clientProcessId = ProcessId.of("client-" + spec.name());
                 TransactionalStorageClient client = cluster.newClient(clientProcessId, TransactionalStorageClient::new);
                 clientMap.put(spec.name(), client);
                 cluster.setTimeForProcess(clientProcessId, spec.startingHlc().getWallClockTime());
+                if (i == 0) firstClient = client;
             }
 
-            TransactionalStorageClient firstClient = clientMap.values().iterator().next();
             TopologyScenario topology = findTopology(firstClient, predicate);
 
             Map<String, TxnId> txnIds = new HashMap<>();
@@ -110,11 +111,16 @@ public class TransactionScenario {
             }
 
             Map<ProcessId, TransactionalStorageReplica> replicas = new HashMap<>();
+            Map<ProcessId, HybridTimestamp> nodeHlcSnapshots = new HashMap<>();
             for (ProcessId nodeId : storageNodes) {
-                replicas.put(nodeId, (TransactionalStorageReplica) cluster.getProcess(nodeId));
+                TransactionalStorageReplica replica =
+                        (TransactionalStorageReplica) cluster.getProcess(nodeId);
+                replicas.put(nodeId, replica);
+                nodeHlcSnapshots.put(nodeId, replica.hybridClock().now());
             }
 
-            return new ScenarioResult(snapshots, commitTimestamps, replicas, clientNames, topology);
+            return new ScenarioResult(snapshots, commitTimestamps, nodeHlcSnapshots,
+                    replicas, clientNames, topology);
 
         } catch (Exception e) {
             throw new RuntimeException("Scenario execution failed", e);

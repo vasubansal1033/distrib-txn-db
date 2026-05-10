@@ -11,6 +11,7 @@ import java.util.Map;
 public class ScenarioResult {
     private final Map<String, HybridTimestamp> snapshots;
     private final Map<String, HybridTimestamp> commitTimestamps;
+    private final Map<ProcessId, HybridTimestamp> nodeHlcSnapshots;
     private final Map<ProcessId, TransactionalStorageReplica> replicas;
     private final List<String> clientNames;
     private final TransactionalStorageReplicaTestSupport.TopologyScenario topology;
@@ -18,12 +19,14 @@ public class ScenarioResult {
     ScenarioResult(
             Map<String, HybridTimestamp> snapshots,
             Map<String, HybridTimestamp> commitTimestamps,
+            Map<ProcessId, HybridTimestamp> nodeHlcSnapshots,
             Map<ProcessId, TransactionalStorageReplica> replicas,
             List<String> clientNames,
             TransactionalStorageReplicaTestSupport.TopologyScenario topology
     ) {
         this.snapshots = snapshots;
         this.commitTimestamps = commitTimestamps;
+        this.nodeHlcSnapshots = nodeHlcSnapshots;
         this.replicas = replicas;
         this.clientNames = clientNames;
         this.topology = topology;
@@ -47,11 +50,11 @@ public class ScenarioResult {
 
     public HybridTimestamp hlcAt(TopologyConstraint.NodeRef node) {
         ProcessId processId = resolveNode(node);
-        TransactionalStorageReplica replica = replicas.get(processId);
-        if (replica == null) {
-            throw new IllegalArgumentException("No replica found for node: " + processId);
+        HybridTimestamp hlc = nodeHlcSnapshots.get(processId);
+        if (hlc == null) {
+            throw new IllegalArgumentException("No HLC snapshot recorded for node: " + processId);
         }
-        return replica.hybridClock().now();
+        return hlc;
     }
 
     public String committedValue(String key) {
