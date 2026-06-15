@@ -36,12 +36,13 @@ public class MVCCKey implements Comparable<MVCCKey> {
     // TODO: Exercise 1. Implement comparison.
     @Override
     public int compareTo(MVCCKey other) {
-        // int keyCompare = Arrays.compareUnsigned(this.key, other.key);
-        // if (keyCompare != 0) {
-        //     return keyCompare;
-        // }
-        // return this.timestamp.compareTo(other.timestamp);
-        return 0;
+         int keyCompare = Arrays.compareUnsigned(this.key, other.key);
+         if (keyCompare != 0) {
+             return keyCompare;
+         }
+
+         // tie-breaker using the HybridTimestamp of the key
+         return this.timestamp.compareTo(other.timestamp);
     }
 
     @Override
