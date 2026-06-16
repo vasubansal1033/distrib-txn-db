@@ -156,56 +156,272 @@ RocksDB only understands lexicographic byte order. It has no notion of "timestam
 
 ## `OrderPreservingCodec` — the encoding layer
 
-This class does two jobs: encode basic types (string, int, long) in memcomparable order, and encode MVCC keys for RocksDB.
+This is the part that took me the longest to internalize, so I'll spend real time on it.
 
-### Why "memcomparable" / order-preserving?
+RocksDB is a sorted map of `byte[] → byte[]`. That's it. It doesn't know about strings, integers, timestamps, or MVCC. It only knows how to compare two byte arrays **left to right, unsigned, byte by byte** — like sorting words in a dictionary. Whichever key has the smaller byte at the first position where they differ wins.
 
-RocksDB iterators move in byte order. If you encode integers as raw big-endian two's complement, `-1` (0xFF...) sorts *after* `+1` (0x00...). Range scans and "find next key" break for negative numbers.
+`OrderPreservingCodec` is the translator. It turns our logical types into bytes that sort the way we *want* when RocksDB compares them. The fancy name you'll see in other databases is **memcomparable** or **order-preserving** encoding: the in-memory sort order of your values should match the byte sort order on disk.
 
-The fix is old hat: XOR the sign bit before writing.
+The class does two jobs:
+
+1. Encode basic types (`String`, `int`, `long`) so their numeric/string order matches byte order
+2. Encode full MVCC keys (`logical key + timestamp`) so versioned storage and snapshot reads work with RocksDB's `seek` and iterators
+
+---
+
+### First idea: RocksDB only speaks byte order
+
+Say you store three keys in RocksDB. Internally it keeps them sorted:
+
+```
+"apple"   → ...
+"banana"  → ...
+"cherry"  → ...
+```
+
+If you `seek("ban")`, RocksDB jumps to the first key **≥ `"ban"`** in byte order — that's `"banana"`. You didn't write a SQL query. You just exploited the fact that keys are already sorted lexicographically.
+
+Every MVCC operation in `RocksDbMvccStore` — `getLatest`, `getAsOf`, prefix scans — is built on `seek` and "walk forward from here." So the bytes we write **must** sort in an order that matches our logical intent. Get the encoding wrong and reads return the wrong version, or prefix scans pull in unrelated keys, and nothing throws an error — it just silently lies.
+
+---
+
+### Second idea: integers don't sort correctly as raw bytes
+
+This one is subtle until you see a concrete example.
+
+Suppose you want to store integers as 4-byte big-endian values (how Java's `putInt` works). You'd expect: store 1, then 2, then 100 — iterate — get them back in ascending order.
+
+Works fine for positive numbers:
+
+```
+  1  →  00 00 00 01
+  2  →  00 00 00 02
+100  →  00 00 00 64
+```
+
+Byte order matches numeric order. Good.
+
+Now throw in a negative number:
+
+```
+ -1  →  FF FF FF FF
+  1  →  00 00 00 01
+```
+
+Compare byte by byte: `FF` > `00`, so **-1 sorts after 1** in RocksDB. That's backwards. Any range scan for "keys from -100 to 100" is wrong the moment negatives exist. Real databases store plenty of negative ints (account balances, deltas, hash offsets).
+
+**The fix:** flip the sign bit before writing, flip it back after reading.
 
 ```java
-int toggled = value ^ 0x80000000;  // int
-long toggled = value ^ 0x8000000000000000L;  // long
+// encode
+int toggled = value ^ 0x80000000;
+// decode
+int value = toggled ^ 0x80000000;
 ```
 
-After toggling, numeric order matches unsigned byte order. CockroachDB, YugabyteDB, MongoDB WiredTiger all do variants of this. The comments in the source link to their encoders.
-
-Strings are just UTF-8 bytes here — fine for workshop keys, though production systems often escape `0x00` inside string components so delimiters stay unambiguous.
-
-### MVCC physical key format
+What this does in plain terms: it remaps the number line so the smallest int maps to all-zero bytes and the largest int maps to all-one bytes.
 
 ```
-[LogicalKeyBytes] + [0x00] + [~wallClockTime] + [~ticks]
+    -1  →  (flip)  →  7F FF FF FF   → sorts before...
+     0  →  (flip)  →  80 00 00 00
+     1  →  (flip)  →  80 00 00 01   → ...sorts before...
+   100  →  (flip)  →  80 00 00 64
 ```
 
-Three decisions baked into this layout. Each one exists because something breaks if you skip it.
+Now byte order **is** numeric order. Same trick for `long` with `0x8000000000000000L`. CockroachDB, YugabyteDB, and MongoDB WiredTiger all do variants of this — it's the standard way to put signed numbers into an LSM tree.
 
-**The `0x00` separator**
+**Strings** in this module are just UTF-8 bytes with no extra escaping. Fine for workshop keys like `"customers_customer_1_name"`. Production systems often forbid or escape `0x00` inside string parts because we also use `0x00` as a structural delimiter in MVCC keys (next section).
 
-Logical key bytes come first, then a zero byte, then the timestamp. `0x00` is the smallest possible byte, so any key that shares a prefix but is *shorter* sorts before keys that continue past the prefix. `"User"` sorts before `"User1"`.
+---
 
-Without the separator, timestamp bytes glue directly onto the logical key. Timestamps are bit-inverted (see below), which often produces high bytes like `0xFF`. Then `"User" + [0xFF...]` can sort *after* `"User1 + [0x00...]"`. All versions of `"User"` scatter away from each other; prefix scans bleed into neighboring keys. The source comments spell out this failure mode — it's not theoretical, the tests will fail.
+### Third idea: what an MVCC key looks like on disk
 
-**Bit-inverted timestamps**
+In memory, an `MVCCKey` is a logical key + `HybridTimestamp`. On disk it becomes one flat byte array:
 
-Wall clock and ticks are written as `~wallClockTime` and `~ticks`. Newer timestamps become *smaller* byte sequences.
+```
+[LogicalKeyBytes]  +  [0x00]  +  [~wallClockTime (8 bytes)]  +  [~ticks (4 bytes)]
+```
 
-Why? RocksDB `seek(key)` finds the first key ≥ target. If newer versions sort first, seeking to a logical key prefix lands on the latest version immediately. `getLatest` becomes a seek, not a full scan. Snapshot scans can walk backward through history with `seek` + `next` in iterator order.
+Example: logical key `"author"` at timestamp `(wallClock=2000, ticks=0)`.
 
-`OrderPreservingCodecWithRocksDBTests` demonstrates this directly: store versions at T=1000, 2000, 5000. Iterator order is 5000 → 2000 → 1000. Seek to `MAX_VALUE` timestamp → you get the newest. Seek to T=3000 → you get the version at 2000 (newest that's still ≤ 3000).
+```
+"author"           →  61 75 74 68 6F 72          (UTF-8)
+separator          →  00
+~2000 as long      →  (8 bytes of inverted wall clock)
+~0 as int          →  (4 bytes of inverted ticks)
+```
 
-**Fixed timestamp width**
+`decodeMVCCKey` reverses this: find the separator, read the 12 timestamp bytes, bit-invert them back, reconstruct the `HybridTimestamp`.
 
-8 bytes wall clock + 4 bytes ticks = 12 bytes. Combined with the separator, the null byte is always at `length - 13`. `decodeMVCCKey` relies on this — no scanning for the separator, just arithmetic.
+Three design choices here. Each one solves a specific problem.
 
-### Encode / decode API
+---
 
-- `encodeMVCCKey(MVCCKey)` → physical RocksDB key
-- `decodeMVCCKey(byte[])` → `MVCCKey`
-- `decodeMVCCLogicalKey(byte[])` → just the logical prefix
-- `decodeMVCCTimestamp(byte[])` → just the timestamp
-- `encode(HybridTimestamp)` → timestamp suffix only (used in tests)
+### The `0x00` separator — why a random zero byte matters
+
+The separator sits between the logical key and the timestamp. `0x00` is the **smallest possible byte value**.
+
+That means if two logical keys share a prefix, the **shorter** one always sorts first:
+
+```
+"User"   →  55 73 65 72  00  [timestamp bytes...]
+"User1"  →  55 73 65 72  31  00  [timestamp bytes...]
+                      ↑
+            first difference: 00 vs 31
+            00 wins → "User" sorts before "User1"
+```
+
+This is exactly what you want. All versions of `"User"` cluster together in the keyspace, and `"User"` as a prefix doesn't collide with `"User1"`.
+
+**What goes wrong without it:**
+
+Say you skip the separator and glue the timestamp directly after the logical key. Timestamps are bit-inverted (next section), which often starts with high bytes like `0xFF`:
+
+```
+"User"  + timestamp(T=1000)  →  55 73 65 72  FF FF ...
+"User1" + timestamp(T=5000)  →  55 73 65 72  31  7F ...
+```
+
+At the first differing byte after the shared prefix `55 73 65 72`:
+
+- `"User"` path has `FF`
+- `"User1"` path has `31`
+
+`FF > 31`, so **every version of `"User"` sorts after `"User1"`** — not adjacent, not under the same prefix. A prefix scan for `"User"` misses your own versions and may pick up garbage from `"User1"`. The comments in `OrderPreservingCodec.java` call this out explicitly; `OrderPreservingCodecWithRocksDBTests` and the prefix scan tests fail if you remove the separator.
+
+---
+
+### Bit-inverted timestamps — why newer versions sort *first*
+
+Normally we'd want time to move forward: T=1000 < T=2000 < T=5000. In byte order that would mean older versions appear first in the RocksDB iterator.
+
+But we almost always want the **latest** version. `getLatest("author")` should be one `seek`, not a scan through every historical version.
+
+So we **invert** the timestamp bits before writing:
+
+```java
+buffer.putLong(~timestamp.getWallClockTime());
+buffer.putInt(~timestamp.getTicks());
+```
+
+And invert back on read:
+
+```java
+new HybridTimestamp(~invertedTime, ~invertedTicks);
+```
+
+Inversion flips the sort order. Bigger timestamps become smaller byte sequences:
+
+```
+T=1000  →  invert  →  sorts LAST in RocksDB iteration
+T=2000  →  invert  →  sorts in the middle
+T=5000  →  invert  →  sorts FIRST
+```
+
+`OrderPreservingCodecWithRocksDBTests.invertedTimestampEncodingOrdersNewerVersionsFirstInRocksDB` stores three timestamp-only keys and walks the iterator:
+
+```
+Stored:  T=1000 → "value1",  T=2000 → "value2",  T=5000 → "value5"
+
+Iterator order:  5000, then 2000, then 1000  (newest first)
+```
+
+Two operations that become easy because of this:
+
+**`getLatest`** — seek to the logical key prefix. You're instantly on the newest version.
+
+```java
+iterator.seek(encodeString("author"));
+// lands on author@T=2000, not author@T=1000
+```
+
+The test `seekingToLogicalKeyPrefixReturnsNewestVersionFirst` checks exactly this: after writing `author@1000` and `author@2000`, seeking to `"author"` returns `"Unmesh"` (the newer write), not `"Martin"`.
+
+**`getAsOf` at timestamp T** — seek to `(logicalKey, T)` encoded. Inverted order means you land on the **newest version whose timestamp is still ≤ T**.
+
+```
+Versions: 1000, 2000, 5000
+
+seek(asOf=3000)  →  first key ≥ encoded(3000)  →  the version at 2000
+```
+
+That's the second half of `invertedTimestampEncodingOrdersNewerVersionsFirstInRocksDB`: after seeking to 3000, you get `"value2"` (written at T=2000), not `"value5"` (T=5000, too new) and not `"value1"` (T=1000, too old).
+
+Worth sitting with for a minute: we're not changing how timestamps *compare* logically. `HybridTimestamp.compareTo` still says 2000 < 5000. We're only changing how they're **serialized** so RocksDB's physical iteration order matches the access patterns we need.
+
+---
+
+### Putting it together: a full MVCC key walkthrough
+
+Store two versions of `"author"` and one version of `"title"`:
+
+```java
+put("author", T=1000, "Martin")
+put("author", T=2000, "Unmesh")
+put("title",  T=1500, "The Art of Computer Programming")
+```
+
+Physical keys in RocksDB (conceptually):
+
+```
+author \0 [inv ts 2000]   →  "Unmesh"     ← newest author, sorts first
+author \0 [inv ts 1000]   →  "Martin"
+title  \0 [inv ts 1500]   →  "The Art..."
+```
+
+`seek("author")` → `"Unmesh"`. `next()` → `"Martin"`. `next()` → `"The Art..."` (different logical key, still in byte order).
+
+For a snapshot read of `author` at T=1500: encode search key `author + \0 + inv(1500)`, seek there. Newest version ≤ 1500 is the T=1000 write → `"Martin"`. That's `getAsOf` in one seek.
+
+For `Table.getRow("customer_1", T=2000)`: prefix scan on `"customers_customer_1_"`. Iterator walks all keys with that prefix, newest version per column first; keep the first visible one per column at T=2000. Column keys were encoded separately, but the same seek-and-walk logic applies.
+
+---
+
+### Fixed-width timestamps — why decode is simple
+
+Wall clock is always 8 bytes. Ticks always 4 bytes. Separator always 1 byte right before them.
+
+So for any physical key, the separator is **always** at index `length - 13`. No scanning, no guessing. `decodeMVCCKey` just does arithmetic:
+
+```java
+int nullPos = dbPhysicalKey.length - 13;
+byte[] logicalKey = copyOf(dbPhysicalKey, nullPos);
+// read 12 bytes after nullPos + 1
+```
+
+If that byte isn't `0x00`, the key is corrupted (or wasn't written by this codec). Throw.
+
+---
+
+### Encode / decode API (quick reference)
+
+| Method | What it does |
+|--------|--------------|
+| `encodeString` / `decodeString` | UTF-8 bytes |
+| `encodeInt` / `decodeInt` | sign-bit flip for sortable ints |
+| `encodeLong` / `decodeLong` | sign-bit flip for sortable longs |
+| `encodeMVCCKey` | full physical RocksDB key from `MVCCKey` |
+| `decodeMVCCKey` | `MVCCKey` from physical bytes |
+| `decodeMVCCLogicalKey` | just the logical prefix |
+| `decodeMVCCTimestamp` | just the timestamp suffix |
+| `encode(HybridTimestamp)` | timestamp suffix only (handy in tests) |
+
+---
+
+### If you want to go deeper
+
+The tests to read alongside this section:
+
+- `OrderPreservingCodecWithRocksDBTests` — inverted timestamp iteration and seek behavior, raw in RocksDB
+- `RocksDbMvccStoreTest.needsMemcompatibleEncoding` — multiple versions + multiple logical keys through the full encode path
+- `InMemoryMVCCStoreTest.testFetchAsOfTime` — same as-of semantics, in-memory vs RocksDB backends should agree
+
+Production encoders with more type tags, NULL handling, and escaped strings:
+
+- [CockroachDB encoding](https://github.com/cockroachdb/cockroach/blob/master/pkg/util/encoding/encoding.go)
+- [YugabyteDB DocDB keys](https://github.com/yugabyte/yugabyte-db/blob/master/src/yb/dockv/doc_key.cc)
+- [MongoDB KeyString](https://github.com/mongodb/mongo/blob/master/src/mongo/db/storage/key_string/key_string.cpp)
+- [RocksDB](https://rocksdb.org/) — the LSM engine itself
 
 ---
 
@@ -309,17 +525,6 @@ See [EXERCISE.md](EXERCISE.md). Implement `MVCCKey.compareTo(...)`. Everything e
 ```bash
 ./gradlew :02-versioned-kv:test --tests kv.MVCCKeyTest
 ```
-
----
-
-## Real-world references
-
-Encoding and layout comparisons if you want to go deeper:
-
-- [CockroachDB key encoding](https://github.com/cockroachdb/cockroach/blob/master/pkg/util/encoding/encoding.go)
-- [YugabyteDB DocDB keys](https://github.com/yugabyte/yugabyte-db/blob/master/src/yb/dockv/doc_key.cc)
-- [MongoDB KeyString (WiredTiger)](https://github.com/mongodb/mongo/blob/master/src/mongo/db/storage/key_string/key_string.cpp)
-- [RocksDB](https://rocksdb.org/) itself — the LSM engine under a lot of this
 
 ---
 
