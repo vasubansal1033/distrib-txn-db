@@ -1,160 +1,66 @@
 # 04 — Distributed Transactional Key-Value Store
 
-Module `03` gave us a distributed MVCC store: route a key to the right node, read or write a version, propagate HLC timestamps. Every operation was independent. There was no `BEGIN`, no `COMMIT`, no guarantee that two writes happened atomically or that a read saw a consistent slice of the database.
+Module `03` gave us distributed MVCC: route a key to a node, read or write a version, propagate HLC timestamps. Each operation stood alone — no `BEGIN`, no `COMMIT`, no guarantee that a batch of reads and writes happened as one unit.
 
-This module adds **transactions**. A client opens a transaction, reads and writes keys (possibly on different nodes), then commits. Writes are **provisional** until commit. Reads see a fixed **snapshot** plus the transaction's own uncommitted writes. On commit, a **coordinator** marks the transaction committed and tells participant nodes to move intents into the committed store.
+This module adds **transactions**. The motivating requirement is **atomic commit**: a client does multiple reads and writes, possibly spread across nodes, and wants them to succeed or fail **together** — one atomic unit of work, not a half-applied transfer.
 
-We're implementing **Snapshot Isolation (SI)** here — not full serializability yet. That comes in module `06`. We also don't handle clock-uncertainty read restart yet — that's module `05`.
-
-This is the core hands-on module of the workshop. Expect to implement pieces of `TransactionalStorageReplica.java` and run tests until they pass. See [EXERCISE.md](EXERCISE.md) for the step-by-step path.
+We're building **Snapshot Isolation (SI)** here, not full serializability (`06`) and not clock-uncertainty read restart yet (`05`). This is the main hands-on module — you'll implement pieces of `TransactionalStorageReplica.java`. See [EXERCISE.md](EXERCISE.md).
 
 ---
 
-## What we're building (in one picture)
+## What we need on top of basic key-value storage
 
-Each storage node has **two** MVCC stores:
+Once you need atomic commit across nodes, module `03`'s model isn't enough. Several things have to be added.
+
+### Writes cannot go straight to the final store
+
+In module `03`, a write lands in the MVCC store immediately — other clients can read it on the next request. That breaks down inside a transaction:
 
 ```
-┌─────────────────────────────────────────┐
-│  TransactionalStorageReplica (one node) │
-│                                         │
-│  committedStore  ← durable, visible     │
-│                    versions after commit│
-│                                         │
-│  intentStore     ← provisional writes   │
-│                    from in-flight txns  │
-│                                         │
-│  txnRecords      ← in-memory coordinator│
-│                    state (one node only)│
-└─────────────────────────────────────────┘
+T1: WRITE account → $1100     ← if this hits committedStore now...
+T2: READ account              ← ...T2 sees uncommitted data
+T1: aborts
 ```
 
-- **`committedStore`** — what the world looks like after transactions commit. Snapshot reads (for other transactions) come from here.
-- **`intentStore`** — write intents. A key with an intent means "some transaction *might* commit this value." Intents block or complicate other operations until resolved.
-- **`txnRecords`** — lives only on the node that plays **coordinator** for a given `txnId`. Tracks `PENDING` / `COMMITTED` / `ABORTED`, read timestamp, commit timestamp.
+Transactional writes going to individual nodes **cannot be exposed** to the final key-value store or to other clients until the atomic unit is decided successful. You need **provisional / intermediate storage** — our `intentStore` — plus a separate **committed** store that snapshot reads trust.
 
-The client (`TransactionalStorageClient`) tracks which keys it wrote on which participant nodes, so commit can send resolve requests to the right places.
+### Someone must track whether the unit succeeded — but not only on the client
+
+When all reads and writes in a transaction finish successfully, **someone** has to record that decision and tell each participating node to publish or discard its provisional data.
+
+The client is the natural **coordinator of work** — it's the one that knows "I'm done, commit." But the client **cannot be the sole place that tracks transaction state**. If it were:
+
+- the client crashes after writes landed on servers but before everyone was told to commit
+- messages from client to individual nodes get lost
+
+…then nodes are stuck with provisional data and no authoritative answer on whether the transaction committed.
+
+So: **client drives the workflow; a server holds the transaction record.** That server is the **transaction coordinator** (transaction manager). One node in the cluster is chosen per transaction — in our code, `hash(txnId) % numNodes`.
+
+### Each node carries extra state
+
+Apart from key-value storage (`committedStore`), each `TransactionalStorageReplica` also has:
+
+- **`intentStore`** — provisional writes, each tagged with a **transaction ID**
+- **`txnRecords`** — on whichever node is coordinator for that txn: `PENDING` / `COMMITTED` / `ABORTED`, snapshot timestamp, commit timestamp
+
+(Production systems also **replicate** each node's state with Raft/Paxos. We skip that in this workshop — single copy per shard — but the coordinator record and intents are the logical layer that replication would persist.)
 
 ---
 
-## Why not classic Two-Phase Commit (2PC)?
+## End-to-end flow (as in the lecture)
 
-In a talk around this material, 2PC often comes up as the "obvious" way to commit a distributed transaction. Worth understanding why this workshop — and systems like CockroachDB — do something different.
+This is the typical path the talk walks through, mapped to our code.
 
-### What 2PC looks like
+**1. Client picks a transaction ID** — usually a UUID (`TxnId`). Before any work, it designates a coordinator: `hash(txnId)` picks a cluster member.
 
-Classic **two-phase commit** has a coordinator and participants:
+**2. Begin** — client sends `BEGIN` to the coordinator. Coordinator creates a `TxnRecord` (`PENDING`) and returns a snapshot timestamp (`readTs`). Every later read in this transaction uses that fixed point.
 
-**Phase 1 — Prepare (vote):** Coordinator asks every participant: "Can you commit?" Each participant writes a prepare record, acquires locks, and votes yes or no.
+**3. Reads and writes** — client sends `TXN_READ` / `TXN_WRITE` to the node that owns each key (`hash(key)`), always **tagged with the transaction ID**. Writes go to **`intentStore`** with an `IntentRecord(txnId, value)` — not to `committedStore`.
 
-**Phase 2 — Commit or abort:** If everyone voted yes, coordinator says commit. Otherwise abort. Participants apply the decision and release locks.
+**4. Commit (when everything succeeded locally)** — client sends `COMMIT` to the **coordinator first**. Coordinator marks the transaction **committed**, assigns `commitTimestamp`, and sends resolve/commit messages to participant nodes. Participants **move** provisional data into `committedStore` and delete the intent. Only then is the write visible to other clients' snapshot reads.
 
-```mermaid
-sequenceDiagram
-    participant C as Coordinator
-    participant P1 as Participant 1
-    participant P2 as Participant 2
-
-    Note over C,P2: Phase 1 — Prepare
-    C->>P1: PREPARE
-    C->>P2: PREPARE
-    P1-->>C: YES (locked)
-    P2-->>C: YES (locked)
-
-    Note over C,P2: Phase 2 — Commit
-    C->>P1: COMMIT
-    C->>P2: COMMIT
-    P1-->>C: ACK
-    P2-->>C: ACK
-```
-
-Looks clean. The problem is failure.
-
-### The blocking problem
-
-If the **coordinator crashes after participants have voted YES** but before sending COMMIT, participants are stuck. They voted "I can commit" and hold locks. They don't know whether the transaction ultimately committed or aborted. They must **block**, waiting for the coordinator to recover. Other transactions that touch those keys can stall indefinitely.
-
-```mermaid
-sequenceDiagram
-    participant C as Coordinator
-    participant P1 as Participant 1
-    participant P2 as Participant 2
-
-    C->>P1: PREPARE
-    C->>P2: PREPARE
-    P1-->>C: YES (locked, waiting...)
-    P2-->>C: YES (locked, waiting...)
-
-    Note over C: Coordinator crashes here
-    Note over P1,P2: Participants hold locks.<br/>Cannot commit or abort alone.<br/>Other txns block on these keys.
-```
-
-This is 2PC's famous **blocking** flaw. It's why production OLTP systems moved to variants that don't leave shards holding indefinite locks waiting for a single coordinator's fate.
-
-There are mitigations (3PC, Paxos/Raft-backed transaction records, coordinator failover with durable logs), but the core tension remains: **tight prepare/commit coupling + coordinator as single point of ambiguity = blocking under failure.**
-
-### What this module does instead
-
-We use a **transaction record + provisional intents** model, closer to CockroachDB's approach than to textbook blocking 2PC:
-
-1. **Begin** — coordinator creates an in-memory `TxnRecord` (`PENDING`). Cheap, no cross-node prepare vote.
-2. **Write** — participant stores an **intent** in `intentStore`, not in `committedStore`. The value is visible to the writing transaction (read-your-own-writes) but not to others' snapshot reads.
-3. **Commit** — coordinator picks a commit timestamp, marks `TxnRecord` as `COMMITTED`, and **fires resolve requests** to participants. Participants move intents → committed store.
-4. **Lazy resolution** — if a read or write hits someone else's unresolved intent, we ask that transaction's coordinator for status and resolve or conflict on the spot.
-
-Important detail from the code: **we do not wait for resolve responses during commit.** The client gets commit ACK once the coordinator has marked the transaction committed and sent resolve messages. Resolution is asynchronous. That's a deliberate simplification — and another departure from 2PC's "everyone must ACK phase 2 before success."
-
-```mermaid
-sequenceDiagram
-    participant Client
-    participant Coord as Coordinator node
-    participant Part as Participant node<br/>(key owner)
-
-    Client->>Coord: BEGIN(txnId)
-    Coord-->>Client: readTs (snapshot time)
-
-    Client->>Part: WRITE(txnId, key, value)
-    Part->>Part: intentStore.put(intent)
-    Part-->>Client: OK
-
-    Client->>Coord: COMMIT(txnId, participantWrites)
-    Coord->>Coord: txnRecord.status = COMMITTED
-    Coord->>Part: RESOLVE(txnId, keys, commitTs)
-    Note over Coord,Part: Fire-and-forget — no wait for resolve ACK
-    Coord-->>Client: commitTs
-
-    Part->>Part: committedStore.put(version)
-    Part->>Part: intentStore.delete(intent)
-```
-
-No prepare-phase lock vote. No indefinite blocking if the coordinator disappears mid-commit (though unresolved intents and coordinator records have their own cleanup story — we use tick-based timeouts to evict abandoned `TxnRecord`s). The tradeoff: more subtle read/write paths, intent resolution logic, and snapshot validation rules.
-
----
-
-## Routing: two different hashes
-
-Module `03` routed by `hash(key)`. Now we have two routing decisions:
-
-| What | Route by | Example |
-|------|----------|---------|
-| **Coordinator** for a transaction | `hash(txnId) % numNodes` | `txn-1` → `storage-node-2` |
-| **Participant** for a key | `hash(key) % numNodes` | `"account-101"` → `storage-node-1` |
-
-```java
-// ReplicaRouting.java
-coordinatorFor(txnId)  →  replicas.get(floorMod(txnId.hashCode(), n))
-replicaFor(key)        →  replicas.get(floorMod(key.hashCode(), n))
-```
-
-A single transaction often touches **multiple nodes**. The client writes `"account-101"` on node 1 and `"account-202"` on node 2, but commit goes to whichever node owns `txnId`. The client bundles `List<ParticipantWrites>` — "on node 1 I wrote these keys, on node 2 those keys" — into the commit request.
-
-The coordinator record starts with an **empty** participant set at begin time. Participants are discovered as writes happen. Only at commit does the coordinator know the full footprint.
-
----
-
-## Transaction lifecycle — happy path
-
-Here's a full pass: begin, write, read your own write, commit, resolve.
+**5. If messages are lost or the client dies** — participant nodes still have provisional records **with the transaction ID**. When another client reads or writes that key, the node asks the **coordinator** for transaction status and reconciles — the same *lazy repair* instinct as Cassandra **read repair** (see below). The coordinator is the source of truth; the client doesn't have to be alive for recovery to progress.
 
 ```mermaid
 sequenceDiagram
@@ -162,342 +68,193 @@ sequenceDiagram
     participant Coord as Coordinator<br/>hash(txnId)
     participant Part as Participant<br/>hash(key)
 
-    Note over Client,Part: 1. Begin — pick snapshot
-    Client->>Coord: BEGIN(txnId, SNAPSHOT)
-    Coord->>Coord: txnRecords[txnId] = PENDING, readTs
-    Coord-->>Client: propagatedTime (= readTs)
-    Client->>Client: store readTs for this txn
+    Client->>Client: choose txnId (UUID)
+    Client->>Coord: BEGIN(txnId)
+    Coord->>Coord: txnRecord = PENDING, readTs
+    Coord-->>Client: readTs
 
-    Note over Client,Part: 2. Write — provisional intent
-    Client->>Part: TXN_WRITE(txnId, key, value, readTs)
-    Part->>Part: intentStore.put(key, intent{txnId, value})
-  Note over Part: committedStore unchanged
-    Part-->>Client: OK
+    Client->>Part: TXN_WRITE(txnId, key, value)
+    Part->>Part: intentStore ← {txnId, value}
+    Note over Part: committedStore unchanged
 
-    Note over Client,Part: 3. Read — own intent wins
-    Client->>Part: TXN_READ(txnId, key, readTs)
-    Part->>Part: find own intent for txnId
-    Part-->>Client: value from intent
+    Client->>Part: TXN_READ(txnId, key)
+    Part->>Part: own intent? → return it
+    Part-->>Client: value
 
-    Note over Client,Part: 4. Commit — coordinator decides
-    Client->>Coord: COMMIT(txnId, [{Part, [keys]}])
-    Coord->>Coord: commitTs = now(), status = COMMITTED
+    Client->>Coord: COMMIT(txnId, participants + keys)
+    Coord->>Coord: status = COMMITTED, commitTs
     Coord->>Part: RESOLVE(txnId, keys, commitTs)
-    Coord-->>Client: commitTs
+    Coord-->>Client: OK
 
-    Note over Client,Part: 5. Resolve — intent → committed
-    Part->>Part: committedStore.put(key, commitTs, value)
+    Part->>Part: committedStore ← value @ commitTs
     Part->>Part: intentStore.delete(intent)
+
+    Note over Client,Part: If RESOLVE is lost or client dies:<br/>later read/write hits intent → ask Coord for status → resolve
 ```
 
-### Begin
+### Routing (two hashes)
 
-Client sends `BeginTransactionRequest(txnId, isolationLevel, clientTime)` to `coordinatorFor(txnId)`.
+| Route | By | Role |
+|-------|-----|------|
+| Coordinator | `hash(txnId)` | Owns `TxnRecord`, receives BEGIN/COMMIT |
+| Participant | `hash(key)` | Owns key data, receives reads/writes/resolves |
 
-Coordinator merges the client clock, creates a `TxnRecord`:
-
-```java
-TxnRecord(txnId, PENDING, readTimestamp=propagatedTime, commitTimestamp=null, ...)
-```
-
-The `propagatedTime` returned to the client becomes the transaction's **snapshot timestamp** (`readTs`). All reads in this transaction use that fixed point — committed data visible at `readTs`, not at "now."
-
-### Provisional write
-
-Client sends `TxnWriteRequest(txnId, key, value, readTs, clientTime)` to `replicaFor(key)`.
-
-Participant stores in **`intentStore`**, not `committedStore`:
-
-```java
-intentStore.put(MVCCKey(key, intentTimestamp), IntentRecord(txnId, value))
-```
-
-Other transactions' snapshot reads don't see this yet. Your own transaction does — that's read-your-own-writes.
-
-### Transactional read
-
-Order of checks in `beginRead`:
-
-1. **Own intent?** Return it. Don't compare intent timestamp to `readTs` — intents are stamped at write time, which is usually *after* `readTs`. Requiring `intentTs ≤ readTs` would break read-your-own-writes.
-2. **Someone else's intent?** Ask their coordinator for status (see intent resolution below).
-3. **Otherwise** — `committedStore.getAsOf(key, readTs)`.
-
-### Commit and resolve
-
-Client sends `CommitTransactionRequest(txnId, participantWrites, clientTime)` to the coordinator.
-
-Coordinator:
-
-1. Sets `TxnRecord.status = COMMITTED`, assigns `commitTimestamp`
-2. Sends `ResolveTransactionRequest` to each participant (fire-and-forget)
-3. Returns `CommitTransactionResponse` to client
-
-Each participant's `resolve`:
-
-```java
-committedStore.put(versionedKey(key, commitTimestamp), value);
-intentStore.delete(intent);
-```
+One transaction often touches multiple participants; commit still goes to the coordinator. The client tracks `ParticipantWrites` — which keys it wrote on which nodes — and sends that list with `COMMIT`.
 
 ---
 
-## Intent resolution — when you meet someone else's write
+## Two-phase commit — two meanings
 
-A key with a lingering intent is ambiguous: maybe that transaction will commit, maybe it will abort. Reads and writes that encounter another transaction's intent can't proceed blindly.
+The lecture frames what we built as **two-phase commit**:
 
-They send `GetTransactionStatusRequest` to **that transaction's coordinator** and branch on the answer:
+| Phase | What happens | Data visible to others? |
+|-------|----------------|-------------------------|
+| **1 — Provisional write** | Writes land in `intentStore` with txn id | **No** |
+| **2 — Commit** | Coordinator commits; participants promote to `committedStore` | **Yes** |
 
-| Status | On write | On read |
-|--------|----------|---------|
-| `PENDING` | **Fail** — conflicting in-flight transaction | **Ignore** intent, read committed snapshot |
-| `COMMITTED` | Resolve intent → committed store, **retry** write | Resolve intent, then read committed |
-| `ABORTED` | Delete stale intent, **retry** write | Delete stale intent, read committed |
+Data is not exposed to other clients until phase 2 completes. That's the core 2PC *idea*: decide first, publish second.
+
+**Classic textbook 2PC** uses a different phase 1 — **prepare votes and locks** on every participant before any data is considered committed. If the coordinator crashes after participants vote YES, they **block** holding locks, unable to commit or abort alone:
 
 ```mermaid
 sequenceDiagram
-    participant ClientB as Client (txn B)
-    participant Part as Participant node
-    participant CoordA as Coordinator for txn A
+    participant C as Coordinator
+    participant P1 as Participant
+    participant P2 as Participant
 
-    ClientB->>Part: TXN_WRITE(txnB, key, value)
-    Part->>Part: find intent from txn A on key
-
-    Part->>CoordA: GET_STATUS(txnA)
-    CoordA-->>Part: PENDING / COMMITTED / ABORTED
-
-    alt PENDING
-        Part-->>ClientB: WRITE FAILED (conflict)
-    else COMMITTED
-        Part->>Part: move A's intent to committedStore
-        Part->>Part: retry write flow for txn B
-    else ABORTED
-        Part->>Part: delete A's stale intent
-        Part->>Part: retry write flow for txn B
-    end
+    C->>P1: PREPARE
+    C->>P2: PREPARE
+    P1-->>C: YES (locked)
+    P2-->>C: YES (locked)
+    Note over C: crash
+    Note over P1,P2: Blocked until coordinator recovers
 ```
 
-Why reads ignore `PENDING` intents but writes fail: a snapshot read at `readTs` is allowed to pretend in-flight writes don't exist yet. A write is making a decision that could conflict — if someone else is mid-write on the same key, safer to reject and retry.
-
-**HLC propagation matters here.** The status RPC carries timestamps. When txn A's coordinator merges the incoming clock, it gets pushed forward. That affects A's eventual `commitTimestamp` — which feeds into the lost-update prevention rule below. See `lost_update_scenarios.md` in this module for two detailed walkthroughs.
+Our workshop variant **avoids prepare-phase locks**. Phase 1 is cheap intent writes; phase 2 is coordinator decision + resolve RPCs. We don't wait for every resolve ACK before telling the client commit succeeded (simplification). Tradeoff: lingering intents until resolve or lazy cleanup; no indefinite lock blocking.
 
 ---
 
-## Snapshot Isolation and lost updates
+## Lazy resolution and read repair
 
-SI gives each transaction a stable snapshot (`readTs`). Re-reading the same key in the same txn always sees the same data. Range scans are consistent with that snapshot.
+Resolve messages can be lost. Until a participant processes them, an intent sits on a key while `committedStore` may already have (or not have) the final version. Another transaction's read or write that hits that intent **cannot guess** — it asks the **coordinator** for txn status:
 
-What SI **does** prevent: **lost update on the same key**. Two transactions read the same value, both try to write — the first committer wins, the second is rejected.
+| Status | Write path | Read path |
+|--------|------------|-----------|
+| `PENDING` | Fail (conflict) | Ignore intent; read committed snapshot |
+| `COMMITTED` | Promote intent if needed; retry write | Promote intent; read committed |
+| `ABORTED` | Delete stale intent; retry write | Delete intent; read committed |
 
-The rule in code (`failsSnapshotIsolationWriteValidation`):
+This is very similar to **Cassandra read repair**, even though the underlying consistency models differ.
 
-> Before writing key `k`, check whether `committedStore` already has a version of `k` with timestamp **strictly greater than** this transaction's `readTs`. If yes, reject the write.
-
-```java
-// First-committer-wins
-if (committedTimestamp.compareTo(readTimestamp) > 0) {
-    sendWriteFailure("Conflicting committed transaction");
-}
-```
-
-**Example:** balance is $1000. T1 and T2 both read it. T1 commits a write at commitTs=1500. T2 (readTs=1000) tries to write → sees committed version at 1500 > 1000 → **rejected**. T1's update isn't silently overwritten.
+In Cassandra, a partition is replicated on N nodes. A read may contact several replicas; if one is **stale**, the coordinator returns the winning version (last-write-wins by timestamp) and **repairs** stale replicas in the background. No global transaction — eventual consistency per partition.
 
 ```mermaid
 sequenceDiagram
-    participant T1 as Txn 1 (fast)
-    participant T2 as Txn 2 (slow)
-    participant Part as Participant
+    participant Client
+    participant Coord as Read coordinator
+    participant R1 as Replica (fresh)
+    participant R3 as Replica (stale)
 
-    T1->>Part: BEGIN → readTs=1000
-    T2->>Part: BEGIN → readTs=1000
-    T1->>Part: READ account → $1000
-    T2->>Part: READ account → $1000
-    T1->>Part: WRITE account → $1100
-    T1->>Part: COMMIT → commitTs=1500
-    Part->>Part: committed version at 1500
-
-    T2->>Part: WRITE account → $1100
-    Part->>Part: SI check: 1500 > readTs(1000)?
-    Part-->>T2: REJECTED — stale writer
+    Client->>Coord: READ
+    Coord->>R1: READ
+    Coord->>R3: READ
+    R1-->>Coord: A @ ts=100
+    R3-->>Coord: B @ ts=90
+    Coord-->>Client: A
+    Coord->>R3: background repair A @ ts=100
 ```
 
-For the subtler case where clock skew would let a slow coordinator commit *below* a reader's snapshot — HLC propagation during reads pushes clocks forward so commits land above observing transactions. `SnapshotIsolationLostUpdatePreventionTest` and `lost_update_scenarios.md` cover this.
+| | Cassandra read repair | Our intent resolution |
+|---|----------------------|------------------------|
+| Trigger | Read finds replica mismatch | Read/write finds unresolved intent |
+| Authority | Timestamps across replicas | Coordinator `TxnRecord` |
+| Fix | Repair stale replica | Promote or delete intent |
 
-See also [isolation-level.md](isolation-level.md) for a broader comparison of isolation levels.
-
----
-
-## What SI still allows: write skew
-
-SI does **not** prevent **write skew**. Two transactions read overlapping state, write **different keys**, and both commit — breaking an application invariant.
-
-Classic example from `SnapshotIsolationAnomalyTest`:
-
-- Two doctors are on-call. Invariant: at least one must be on-call.
-- T1 reads Alice=on-call, Bob=on-call. Writes Alice=off-call.
-- T2 reads the same. Writes Bob=off-call.
-- No **same-key** write conflict → both commits succeed → zero doctors on-call.
-
-```mermaid
-sequenceDiagram
-    participant T1
-    participant T2
-    participant Store
-
-    Note over Store: Alice=on-call, Bob=on-call
-
-    T1->>Store: READ doctor-alice → on-call
-    T1->>Store: READ doctor-bob → on-call
-    T2->>Store: READ doctor-alice → on-call
-    T2->>Store: READ doctor-bob → on-call
-
-    T1->>Store: WRITE doctor-alice → off-call
-    T2->>Store: WRITE doctor-bob → off-call
-
-    Note over T1,T2: Different keys — no SI write-write conflict
-    T1->>Store: COMMIT ✓
-    T2->>Store: COMMIT ✓
-
-    Note over Store: Invariant broken: nobody on-call
-```
-
-Module `06-serializable-txn` adds machinery to catch this. Module `04` intentionally lets it through so you can see the gap.
+Same instinct: **don't assume everyone agrees; reconcile when you touch the data.** Different problems — replica divergence vs transaction lifecycle — same lazy pattern. Cassandra also has anti-entropy repair and hinted handoff for the same "fix later" philosophy. We target **Snapshot Isolation**, not LWW eventual consistency; SI **rejects** stale writers on the same key instead of silently overwriting.
 
 ---
 
-## Code layout
+## Reads, writes, and isolation
+
+### Transactional read order (`beginRead`)
+
+1. **Own intent?** Return it (read-your-own-writes). Don't require `intentTs ≤ readTs` — intents are stamped at write time, usually after snapshot begin.
+2. **Someone else's intent?** Coordinator status lookup → resolve or ignore (above).
+3. **Else** — `committedStore.getAsOf(key, readTs)`.
+
+### Snapshot Isolation — lost updates prevented
+
+Each txn reads from fixed `readTs`. Before accepting a write on key `k`, check whether `committedStore` already has a version with timestamp **> readTs**. If yes, reject — **first committer wins**. Prevents two txns from reading the same balance and both committing over each other. HLC propagation during reads ensures clock-skewed commits still land above observing snapshots — see `lost_update_scenarios.md`.
+
+### Snapshot Isolation — write skew still possible
+
+SI only conflicts on the **same key**. Two txns can read overlapping rows, write **different** keys, both commit — breaking an invariant (classic on-call doctors example in `SnapshotIsolationAnomalyTest`). Module `06` addresses that.
+
+See [isolation-level.md](isolation-level.md) for the full anomaly matrix.
+
+---
+
+## In the code
 
 ```
-src/main/java/com/distrib/txn/kv/
-  TransactionalStorageClient.java    — smart client: begin, read, write, commit, routing
-  TransactionalStorageReplica.java — storage node + coordinator logic
-  ReplicaRouting.java              — hash(txnId), hash(key)
-  TxnRecord.java, IntentRecord.java, TxnId.java, TxnStatus.java
-  IsolationLevel.java
-  *Request.java / *Response.java   — RPC payloads
-  TransactionalMessageTypes.java
-
-src/test/java/com/distrib/txn/kv/
-  TransactionalStorageReplicaCoreFlowTest.java   — exercises 1–4
-  SnapshotIsolationLostUpdatePreventionTest.java — exercise 5
-  TransactionalStorageReplicaReadResolutionTest.java
-  TransactionalStorageReplicaWriteResolutionTest.java
-  SnapshotIsolationAnomalyTest.java
-  ClockUncertaintySnapshotTest.java
-  dsl/                                         — scenario DSL for lost-update demos
-
-isolation-level.md
-lost_update_scenarios.md
-si_hlc_vs_timestamp_oracle_spec.md
+TransactionalStorageClient     — begin / read / write / commit; tracks readTs + ParticipantWrites
+TransactionalStorageReplica    — committedStore + intentStore + txnRecords; handlers for all RPCs
+ReplicaRouting                 — coordinatorFor(txnId), replicaFor(key)
 ```
 
----
+**Client** (smart-client model): routes directly to coordinator vs shard owner; ticks HLC on every response.
 
-## `TransactionalStorageClient` — the smart client
+**Replica**: implements the flow above. `onTick` evicts abandoned `TxnRecord`s via heartbeat timeout.
 
-This workshop uses a **smart client** model: the client knows cluster membership and routes directly to coordinator vs participant nodes. (A **thin client** would talk to any node and let the server forward — common in production, but routing would be less visible in the code.)
+**Workshop exercises** ([EXERCISE.md](EXERCISE.md)):
 
-The client tracks:
-
-- `transactionStartTimestamps` — `readTs` per `txnId`, set on successful begin
-- `writesByParticipant` — which keys were written on which nodes, fed into commit as `ParticipantWrites`
-
-Every read/write passes `readTs` from begin. Every RPC stamps `hybridClock.now()` and ticks on response — same HLC propagation as module `03`.
-
----
-
-## `TransactionalStorageReplica` — the meat
-
-Each node is both a **shard owner** (for keys hashed to it) and potentially a **coordinator** (for txnIds hashed to it). A node can be one, the other, or both for a given operation.
-
-`onTick` evicts `TxnRecord`s whose heartbeat timeout fired — abandoned transactions don't live forever in coordinator memory.
-
-Key methods you'll implement in the exercises:
-
-| Exercise | What | Code marker |
-|----------|------|-------------|
-| 1 | `beginTransaction` — create `PENDING` record | `// TODO: Exercise 1` |
-| 2 | `writeIntent` — put in `intentStore` | `// Exercise 2` |
-| 3 | `beginRead` — own intent, then committed at `readTs` | `// Exercise 3` |
-| 4 | `commitTransaction` — mark committed, send resolves | `// Exercise 4` |
-| 5 | `failsSnapshotIsolationWriteValidation` | `// Exercise 5` |
-
-Intent resolution (`checkAndResolveIntents`) is provided — study it for the follow-on exercises.
-
----
-
-## Walking through the core tests
-
-**`TransactionalStorageReplicaCoreFlowTest.beginTransactionCreatesPendingTxnRecordOnCoordinator`**
-Begin on coordinator. Assert `TxnRecord` exists, status `PENDING`, isolation level set, timeout ticking, empty participant set.
-
-**`txnWriteStoresIntentAndReadReturnsOwnIntent`**
-Write goes to `intentStore` only. Read in same txn returns the intent value before commit. `committedStore` still empty.
-
-**`txnReadCommittedValuesAtReadTimestamp`**
-Pre-seed committed data at T=900. Begin at T=1000. Read returns the T=900 value (visible at snapshot).
-
-**`commitMovesIntentToCommittedStoreAndMarksTransactionCommitted`**
-After commit: coordinator shows `COMMITTED`, intent gone, value in `committedStore` at `commitTimestamp`.
-
-**`SnapshotIsolationLostUpdatePreventionTest`**
-Two clients, skewed clocks, same key. Leading txn commits first. Lagging txn's write rejected by SI validation.
-
-**`SnapshotIsolationAnomalyTest`**
-Write skew demo — both txns commit, invariant broken.
-
-**`ClockUncertaintySnapshotTest`**
-Shows a snapshot read can miss a value when clock skew puts a write inside the uncertainty window. Motivates module `05`.
-
----
-
-## 2PC vs this design — quick comparison
-
-| | Classic 2PC | This module |
-|---|-------------|-------------|
-| Prepare vote | All participants lock and vote before commit | No prepare phase |
-| Commit coupling | Client success often waits for all ACKs | Commit ACK before resolve completes |
-| Coordinator crash | Participants can block indefinitely | No prepare locks; intents + txn records instead |
-| Visibility | Usually all-or-nothing at commit | Intents visible to writer; others see on resolve |
-| Conflict detection | Locks during prepare | SI validation + intent status checks |
-
-Neither is "free." Intent-based designs need lazy resolution, transaction status lookups, and careful timestamp rules. 2PC needs coordinator recovery protocols and still struggles with blocking. Production systems (CockroachDB, Spanner, Yugabyte) blend MVCC, distributed txn records, and per-key locking or validation in ways that avoid classic blocking 2PC while keeping correctness.
-
----
-
-## Exercise path
-
-See [EXERCISE.md](EXERCISE.md). Suggested order:
-
-1. Begin transaction
-2. Provisional write
-3. Transactional read
-4. Commit and resolve
-5. SI write-write validation
-6. Follow-on: read/write intent resolution tests
-7. Follow-on: anomaly and clock uncertainty tests (discussion)
+| # | Implement | Test focus |
+|---|-----------|------------|
+| 1 | `beginTransaction` → `PENDING` record | `beginTransactionCreatesPendingTxnRecordOnCoordinator` |
+| 2 | `writeIntent` → `intentStore` | `txnWriteStoresIntentAndReadReturnsOwnIntent` |
+| 3 | `beginRead` — own intent, then committed | `txnReadCommittedValuesAtReadTimestamp` |
+| 4 | `commitTransaction` — mark committed, resolve | `commitMovesIntentToCommittedStore...` |
+| 5 | SI write-write validation | `SnapshotIsolationLostUpdatePreventionTest` |
+| follow-on | intent resolution (provided) | `*ReadResolutionTest`, `*WriteResolutionTest` |
+| discussion | write skew, clock uncertainty | `SnapshotIsolationAnomalyTest`, `ClockUncertaintySnapshotTest` |
 
 ```bash
 ./gradlew :04-distrib-txn-kv:test
 ```
 
-Single exercise:
+---
 
-```bash
-./gradlew :04-distrib-txn-kv:test --tests com.distrib.txn.kv.TransactionalStorageReplicaCoreFlowTest.beginTransactionCreatesPendingTxnRecordOnCoordinator
-```
+## How the designs compare
+
+| | Classic 2PC (prepare locks) | This module | Cassandra (classic) |
+|---|----------------------------|-------------|---------------------|
+| Atomic multi-key | Yes | Yes (SI) | No (LWT = Paxos per partition) |
+| Phase 1 | Lock + vote | Provisional intent | Async multi-replica write |
+| Phase 2 | Sync commit ACKs | Coordinator commit + resolve | LWW + read repair |
+| Coordinator crash | Participants **block** | Query coordinator record; resolve intents | Hints + repair |
+| Stale/conflict handling | Blocking | Intent resolution + SI check | Read repair / anti-entropy |
+
+Production OLTP (CockroachDB, Yugabyte, Spanner) blend MVCC, distributed txn records, and validation — closer to our intent model than to blocking 2PC, and stricter than Cassandra's default path.
 
 ---
 
-## Further reading in this module
+## Further reading
 
-- [isolation-level.md](isolation-level.md) — anomaly matrix across isolation levels
-- [lost_update_scenarios.md](lost_update_scenarios.md) — two HLC clock-skew scenarios step by step
-- [si_hlc_vs_timestamp_oracle_spec.md](si_hlc_vs_timestamp_oracle_spec.md) — timestamp oracle vs HLC for SI
+**In this repo:**
+
+- [isolation-level.md](isolation-level.md)
+- [lost_update_scenarios.md](lost_update_scenarios.md)
+- [si_hlc_vs_timestamp_oracle_spec.md](si_hlc_vs_timestamp_oracle_spec.md)
+
+**Cassandra / eventual consistency:**
+
+- [Cassandra read repair](https://cassandra.apache.org/doc/latest/cassandra/managing/operating/read_repair.html)
+- [Lightweight transactions (Paxos per partition)](https://cassandra.apache.org/doc/latest/cassandra/developing/cql/ltw.html)
 
 ---
 
 ## What comes next
 
-**`05-clock-uncertainty-and-read-restart`** — HLC timestamps have an uncertainty window. A snapshot read might miss a write that committed "near" your read timestamp in physical time. Read restart fixes that.
+**`05-clock-uncertainty-and-read-restart`** — snapshot reads can miss writes inside the HLC uncertainty window; read restart fixes that.
 
-**`06-serializable-txn`** — adds protection against write skew using read provisional records, moving toward true serializability.
+**`06-serializable-txn`** — read provisional records to prevent write skew.
